@@ -1,0 +1,126 @@
+import hashlib
+import struct
+
+# Custom P-array extracted from _data_start__ (0x1400B7000), 72 bytes, 18 little-endian DWORDs
+P_BYTES = bytes([
+    0x62,0x51,0xE1,0xB7, 0x6A,0x2A,0xED,0x8A,
+    0x80,0x58,0x71,0xBF, 0xC7,0xF3,0xF4,0x9C,
+    0x0F,0x16,0xE7,0x62, 0x56,0xDA,0xB4,0x38,
+    0x04,0xD9,0x84,0xA7, 0xEF,0xCF,0x90,0x51,
+    0x38,0x77,0x4E,0x32, 0xE5,0xFB,0x6C,0x92,
+    0x8D,0x8D,0xBF,0xF4, 0x63,0xD7,0x31,0x8C,
+    0x0A,0xC8,0x06,0xDA, 0xEB,0x85,0x11,0xBB,
+    0x57,0x7B,0x7C,0x4F, 0x84,0x95,0xF5,0x57,
+    0x7D,0xD4,0xCF,0x90, 0x96,0x72,0xDD,0x7E
+])
+ORIG_P = [struct.unpack_from('<I', P_BYTES, i*4)[0] for i in range(18)]
+
+# Custom S-box generation (LCG seed=0xDEADBEEF)
+def custom_rand(state):
+    state[0] = (1103515245 * state[0] + 12345) & 0xFFFFFFFF
+    return (state[0] >> 16) & 0x7FFF
+
+def generate_sbox_value(state):
+    v2 = custom_rand(state)
+    return (custom_rand(state) | (v2 << 16)) & 0xFFFFFFFF
+
+# Standard Blowfish F function
+def bf_F(S, x):
+    a = (x >> 24) & 0xFF
+    b = (x >> 16) & 0xFF
+    c = (x >> 8) & 0xFF
+    d = x & 0xFF
+    return ((((S[0][a] + S[1][b]) & 0xFFFFFFFF) ^ S[2][c]) + S[3][d]) & 0xFFFFFFFF
+
+# Encrypt matching IDA pseudocode exactly
+def bf_encrypt(P, S, a2, a3):
+    v9 = a2  # L
+    v7 = a3  # R
+    for i in range(16):
+        v4 = (P[i] ^ v9) & 0xFFFFFFFF
+        v9 = (bf_F(S, v4) ^ v7) & 0xFFFFFFFF
+        v7 = v4
+    v5 = v9    # L_final
+    v10 = v7   # R_final
+    new_a2 = (P[17] ^ v10) & 0xFFFFFFFF
+    new_a3 = (P[16] ^ v5) & 0xFFFFFFFF
+    return new_a2, new_a3
+
+# Decrypt (reverse of encrypt)
+def bf_decrypt(P, S, enc_a2, enc_a3):
+    R = (P[17] ^ enc_a2) & 0xFFFFFFFF
+    L = (P[16] ^ enc_a3) & 0xFFFFFFFF
+    for i in range(15, -1, -1):
+        new_L = (P[i] ^ R) & 0xFFFFFFFF
+        new_R = (bf_F(S, R) ^ L) & 0xFFFFFFFF
+        L = new_L
+        R = new_R
+    return L, R
+
+# Init matching IDA: custom P, LCG S-boxes, NO S-box re-encryption
+def bf_init(key_bytes):
+    P = ORIG_P[:]
+    
+    # Generate S-boxes with LCG
+    state = [0xDEADBEEF]
+    S = [[0]*256 for _ in range(4)]
+    for i in range(4):
+        for j in range(256):
+            S[i][j] = generate_sbox_value(state)
+    
+    # XOR key into P-array
+    key_len = len(key_bytes)
+    ki = 0
+    for k in range(18):
+        v9 = 0
+        for m in range(4):
+            v9 = ((v9 << 8) | key_bytes[ki]) & 0xFFFFFFFF
+            ki += 1
+            if ki >= key_len:
+                ki = 0
+        P[k] ^= v9
+    
+    # Re-encrypt P-array ONLY (not S-boxes!)
+    a2, a3 = 0, 0
+    for n in range(0, 18, 2):
+        a2, a3 = bf_encrypt(P, S, a2, a3)
+        P[n] = a2
+        P[n+1] = a3
+    
+    return P, S
+
+# === MAIN ===
+with open("flag.txt.lockergoga", "rb") as f:
+    data = f.read()
+
+assert data[-4:] == b"LGG3"
+orig_size = struct.unpack("<I", data[-8:-4])[0]
+encrypted = data[:-88]
+
+# Key: MD5(SID) first 6 bytes
+sid = "S-1-5-21-1234567890-987654321-1122334455"
+md5_hex = hashlib.md5(sid.encode()).hexdigest()
+key = bytes([int(md5_hex[2*i:2*i+2], 16) for i in range(6)])
+print(f"[+] Key: {key.hex()}")
+
+# Init & verify
+P, S = bf_init(key)
+test = bf_encrypt(P, S, 0x12345678, 0x9ABCDEF0)
+dec = bf_decrypt(P, S, *test)
+print(f"[+] Roundtrip: {'PASS' if dec == (0x12345678, 0x9ABCDEF0) else 'FAIL'}")
+
+# Decrypt file
+decrypted = bytearray()
+for i in range(0, len(encrypted), 8):
+    a2_enc = struct.unpack(">I", encrypted[i:i+4])[0]
+    a3_enc = struct.unpack(">I", encrypted[i+4:i+8])[0]
+    L, R = bf_decrypt(P, S, a2_enc, a3_enc)
+    decrypted.extend(struct.pack(">I", L))
+    decrypted.extend(struct.pack(">I", R))
+
+result = bytes(decrypted[:orig_size])
+print(f"\n[+] Decrypted: {result}")
+print(f"[+] As text: {result.decode('utf-8', errors='replace')}")
+
+with open("flag.txt", "wb") as f:
+    f.write(result)
