@@ -1,0 +1,2 @@
+the image is shuffled with random.seed with password= hash sha256 of the word "Gamra" and each pixel is xored with key " Gamra"
+just need to reverse the logic ;)
